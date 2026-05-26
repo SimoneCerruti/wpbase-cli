@@ -1,13 +1,8 @@
 #!/bin/bash
-# wpbase - manage dockerized-wordpress across multiple projects on the host.
-#
-# Install:
-#   sudo cp wpbase /usr/local/bin/wpbase
-#   sudo chmod +x /usr/local/bin/wpbase
-#   sudo mkdir -p /etc/wpbase
+# wpbase - manage containerized-wordpress across multiple projects on the host.
 #
 # Configure:
-#   echo "https://github.com/YOUR_USER/dockerized-wordpress" | sudo tee /etc/wpbase/repo
+#   echo "https://github.com/SimoneCeruti/containerized-wordpress" | sudo tee /etc/wpbase/repo
 #   echo "/path/to/project" | sudo tee /etc/wpbase/projects.list
 #   # one project path per line in projects.list
 #
