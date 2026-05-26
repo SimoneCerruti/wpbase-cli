@@ -1,0 +1,361 @@
+#!/bin/bash
+# wpbase - manage dockerized-wordpress across multiple projects on the host.
+#
+# Install:
+#   sudo cp wpbase /usr/local/bin/wpbase
+#   sudo chmod +x /usr/local/bin/wpbase
+#   sudo mkdir -p /etc/wpbase
+#
+# Configure:
+#   echo "https://github.com/YOUR_USER/dockerized-wordpress" | sudo tee /etc/wpbase/repo
+#   echo "/path/to/project" | sudo tee /etc/wpbase/projects.list
+#   # one project path per line in projects.list
+#
+# Commands:
+#   wpbase list                    list registered projects with their pinned version
+#   wpbase versions                list available base versions (from GitHub releases)
+#   wpbase install <ver> <path>    install version <ver> into a fresh project at <path>
+#   wpbase update [<path>]         update single project to latest (or to --version X)
+#   wpbase update-all              update every project in projects.list
+#   wpbase diff <path>             show base/ checksum drift (manual edits warning)
+#
+# Flags (where applicable):
+#   --version X.Y.Z   pin to a specific version (default: latest release)
+#   --yes             skip confirmation prompts
+#   --build           also run `docker compose build && up -d` after update
+#   --dry-run         default for update-all; show what would happen, do nothing
+#
+# Exit codes: 0 OK, 1 user error, 2 network/io error, 3 partial failure on update-all
+
+set -uo pipefail
+
+WPBASE_CONF_DIR="${WPBASE_CONF_DIR:-/etc/wpbase}"
+WPBASE_CACHE_DIR="${WPBASE_CACHE_DIR:-/var/cache/wpbase}"
+REPO_FILE="$WPBASE_CONF_DIR/repo"
+PROJECTS_FILE="$WPBASE_CONF_DIR/projects.list"
+
+# ---------- helpers ----------
+die() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
+info() { echo "[wpbase] $*"; }
+warn() { echo "[wpbase] WARN: $*" >&2; }
+
+require_repo() {
+    [[ -f "$REPO_FILE" ]] || die "Missing $REPO_FILE. Write the GitHub repo URL there." 1
+    REPO_URL=$(head -n1 "$REPO_FILE" | tr -d '[:space:]')
+    [[ -n "$REPO_URL" ]] || die "Empty repo URL in $REPO_FILE" 1
+    # Normalize to "owner/repo"
+    REPO_SLUG=$(echo "$REPO_URL" | sed -E 's#^https?://github\.com/##; s#\.git$##; s#/$##')
+    [[ "$REPO_SLUG" =~ ^[^/]+/[^/]+$ ]] || die "Invalid repo URL: $REPO_URL" 1
+}
+
+# Fetch tags via GitHub API (no auth needed for public repos, 60 req/hour anon)
+fetch_latest_version() {
+    require_repo
+    local v
+    v=$(curl -fsS "https://api.github.com/repos/$REPO_SLUG/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
+        | head -n1)
+    [[ -n "$v" ]] || die "Could not fetch latest release from $REPO_SLUG" 2
+    # Strip leading 'v' if present (vX.Y.Z -> X.Y.Z)
+    echo "${v#v}"
+}
+
+fetch_all_versions() {
+    require_repo
+    curl -fsS "https://api.github.com/repos/$REPO_SLUG/releases?per_page=50" \
+        | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
+        | sed 's/^v//'
+}
+
+# Download tarball for a given version into cache, extract, return extracted path
+fetch_tarball() {
+    local version="$1"
+    require_repo
+    mkdir -p "$WPBASE_CACHE_DIR"
+    local cache_dir="$WPBASE_CACHE_DIR/$version"
+
+    if [[ -d "$cache_dir/extracted" ]]; then
+        echo "$cache_dir/extracted"
+        return 0
+    fi
+
+    mkdir -p "$cache_dir"
+    local tarball="$cache_dir/source.tar.gz"
+
+    # GitHub auto-generated tarball URLs: try both with and without leading 'v'
+    local url1="https://github.com/$REPO_SLUG/archive/refs/tags/v${version}.tar.gz"
+    local url2="https://github.com/$REPO_SLUG/archive/refs/tags/${version}.tar.gz"
+
+    info "Downloading base v$version..."
+    if ! curl -fsSL -o "$tarball" "$url1" 2>/dev/null; then
+        curl -fsSL -o "$tarball" "$url2" \
+            || die "Failed to download tarball for version $version" 2
+    fi
+
+    mkdir -p "$cache_dir/extracted"
+    tar -xzf "$tarball" -C "$cache_dir/extracted" --strip-components=1 \
+        || die "Failed to extract tarball" 2
+
+    echo "$cache_dir/extracted"
+}
+
+# Read current base version from a project (returns empty if not initialized)
+project_version() {
+    local project="$1"
+    [[ -f "$project/.base-version" ]] && head -n1 "$project/.base-version" | tr -d '[:space:]'
+}
+
+# Compute a checksum of project's base/ for drift detection
+project_base_checksum() {
+    local project="$1"
+    [[ -d "$project/base" ]] || { echo "MISSING"; return; }
+    find "$project/base" -type f \( ! -name '.checksum' \) -print0 \
+        | sort -z \
+        | xargs -0 sha256sum 2>/dev/null \
+        | sha256sum \
+        | awk '{print $1}'
+}
+
+# Install base files into project (replaces base/ atomically)
+install_base_into_project() {
+    local project="$1" version="$2" extracted="$3"
+
+    [[ -d "$project" ]] || die "Project dir does not exist: $project" 1
+
+    # Warn on drift
+    if [[ -f "$project/base/.checksum" ]]; then
+        local recorded current
+        recorded=$(head -n1 "$project/base/.checksum")
+        current=$(project_base_checksum "$project")
+        if [[ "$recorded" != "$current" ]]; then
+            warn "base/ in $project has been modified manually (checksum drift). Overwriting."
+        fi
+    fi
+
+    local staging
+    staging=$(mktemp -d "$project/.base-staging-XXXXXX")
+    trap "rm -rf '$staging'" RETURN
+
+    # Copy the subset of repo files relevant for the project
+    for d in configs scripts overrides; do
+        [[ -d "$extracted/$d" ]] && cp -a "$extracted/$d" "$staging/"
+    done
+    cp "$extracted/Dockerfile.base" "$staging/" 2>/dev/null || true
+    cp "$extracted/VERSION" "$staging/" 2>/dev/null || true
+
+    # Atomic swap
+    rm -rf "$project/base.old" 2>/dev/null || true
+    [[ -d "$project/base" ]] && mv "$project/base" "$project/base.old"
+    mv "$staging" "$project/base"
+    rm -rf "$project/base.old" 2>/dev/null || true
+    trap - RETURN
+
+    # Pin version + record checksum
+    echo "$version" > "$project/.base-version"
+    project_base_checksum "$project" > "$project/base/.checksum"
+
+    info "Installed base v$version into $project"
+}
+
+# Run docker compose rebuild on a project
+project_rebuild() {
+    local project="$1"
+    info "Rebuilding $project..."
+    ( cd "$project" && docker compose build --no-cache wordpress && docker compose up -d ) \
+        || { warn "Rebuild failed for $project"; return 1; }
+}
+
+confirm() {
+    local prompt="$1"
+    read -r -p "$prompt [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# ---------- commands ----------
+cmd_list() {
+    [[ -f "$PROJECTS_FILE" ]] || die "Missing $PROJECTS_FILE" 1
+    printf "%-50s %-10s %s\n" "PROJECT" "VERSION" "STATUS"
+    while IFS= read -r project; do
+        [[ -z "$project" || "$project" =~ ^# ]] && continue
+        local v status
+        v=$(project_version "$project")
+        if [[ -z "$v" ]]; then
+            status="not-initialized"
+            v="-"
+        elif [[ ! -d "$project/base" ]]; then
+            status="missing-base"
+        else
+            local rec cur
+            rec=$(head -n1 "$project/base/.checksum" 2>/dev/null)
+            cur=$(project_base_checksum "$project")
+            if [[ -n "$rec" && "$rec" != "$cur" ]]; then
+                status="modified"
+            else
+                status="clean"
+            fi
+        fi
+        printf "%-50s %-10s %s\n" "$project" "$v" "$status"
+    done < "$PROJECTS_FILE"
+}
+
+cmd_versions() {
+    fetch_all_versions
+}
+
+cmd_install() {
+    local version="$1" project="$2"
+    [[ -z "${version:-}" || -z "${project:-}" ]] && die "Usage: wpbase install <version> <project-path>" 1
+    [[ "$version" == "latest" ]] && version=$(fetch_latest_version)
+    local extracted
+    extracted=$(fetch_tarball "$version")
+    install_base_into_project "$project" "$version" "$extracted"
+    info "Done. Next: cd $project && docker compose build && docker compose up -d"
+}
+
+cmd_update() {
+    local project="${1:-}"
+    local version="$VERSION_FLAG"
+    [[ -z "$project" ]] && die "Usage: wpbase update <project-path> [--version X]" 1
+    [[ "$version" == "latest" ]] && version=$(fetch_latest_version)
+
+    local current
+    current=$(project_version "$project")
+    if [[ "$current" == "$version" ]] && (( ! FORCE )); then
+        info "$project already at v$version. Use --force to reinstall."
+        return 0
+    fi
+
+    if (( DRY_RUN )); then
+        info "[DRY-RUN] Would update $project from v${current:-none} to v$version"
+        return 0
+    fi
+
+    if (( ! YES )); then
+        confirm "Update $project from v${current:-none} to v$version?" || { info "Aborted."; return 0; }
+    fi
+
+    local extracted
+    extracted=$(fetch_tarball "$version")
+    install_base_into_project "$project" "$version" "$extracted"
+
+    if (( BUILD )); then
+        project_rebuild "$project"
+    else
+        info "Build skipped (use --build to rebuild and restart)."
+    fi
+}
+
+cmd_update_all() {
+    [[ -f "$PROJECTS_FILE" ]] || die "Missing $PROJECTS_FILE" 1
+    local version="$VERSION_FLAG"
+    [[ "$version" == "latest" ]] && version=$(fetch_latest_version)
+
+    info "Target version: v$version"
+    info "Mode: $((( DRY_RUN )) && echo "DRY-RUN" || echo "APPLY")"
+
+    local failed=0 updated=0 skipped=0
+    while IFS= read -r project; do
+        [[ -z "$project" || "$project" =~ ^# ]] && continue
+
+        local current
+        current=$(project_version "$project")
+        if [[ "$current" == "$version" ]] && (( ! FORCE )); then
+            info "[SKIP] $project (already v$version)"
+            ((skipped++))
+            continue
+        fi
+
+        if (( DRY_RUN )); then
+            info "[DRY-RUN] $project: v${current:-none} -> v$version"
+            continue
+        fi
+
+        if (( ! YES )); then
+            confirm "Update $project from v${current:-none} to v$version?" || { info "[SKIP] $project (declined)"; ((skipped++)); continue; }
+        fi
+
+        local extracted
+        extracted=$(fetch_tarball "$version") || { ((failed++)); continue; }
+
+        if install_base_into_project "$project" "$version" "$extracted"; then
+            if (( BUILD )); then
+                project_rebuild "$project" || ((failed++))
+            fi
+            ((updated++))
+        else
+            ((failed++))
+        fi
+    done < "$PROJECTS_FILE"
+
+    info "Summary: updated=$updated skipped=$skipped failed=$failed"
+    (( failed > 0 )) && exit 3 || exit 0
+}
+
+cmd_diff() {
+    local project="${1:-}"
+    [[ -z "$project" ]] && die "Usage: wpbase diff <project-path>" 1
+    [[ ! -d "$project/base" ]] && die "No base/ in $project" 1
+    local rec cur
+    rec=$(head -n1 "$project/base/.checksum" 2>/dev/null)
+    cur=$(project_base_checksum "$project")
+    echo "Recorded: $rec"
+    echo "Current:  $cur"
+    if [[ "$rec" == "$cur" ]]; then
+        echo "Status: clean"
+    else
+        echo "Status: MODIFIED"
+        echo
+        echo "Modified files:"
+        local extracted version
+        version=$(project_version "$project")
+        extracted=$(fetch_tarball "$version")
+        diff -rq "$extracted" "$project/base" 2>/dev/null | grep -v '^Only in' | head -50
+    fi
+}
+
+# ---------- arg parsing ----------
+VERSION_FLAG="latest"
+YES=0
+BUILD=0
+DRY_RUN=0
+FORCE=0
+COMMAND=""
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version) VERSION_FLAG="$2"; shift 2 ;;
+        --version=*) VERSION_FLAG="${1#*=}"; shift ;;
+        --yes|-y) YES=1; shift ;;
+        --build) BUILD=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --help|-h)
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        -*) die "Unknown flag: $1" 1 ;;
+        *)
+            if [[ -z "$COMMAND" ]]; then
+                COMMAND="$1"
+            else
+                ARGS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# update-all is dry-run by default
+[[ "$COMMAND" == "update-all" ]] && (( ! YES && ! BUILD )) && DRY_RUN=1
+
+case "$COMMAND" in
+    list)       cmd_list ;;
+    versions)   cmd_versions ;;
+    install)    cmd_install "${ARGS[@]:-}" ;;
+    update)     cmd_update "${ARGS[@]:-}" ;;
+    update-all) cmd_update_all ;;
+    diff)       cmd_diff "${ARGS[@]:-}" ;;
+    "")         die "Missing command. Run 'wpbase --help'" 1 ;;
+    *)          die "Unknown command: $COMMAND. Run 'wpbase --help'" 1 ;;
+esac
