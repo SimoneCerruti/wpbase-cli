@@ -1,6 +1,6 @@
 # wpbase
 
-A tiny pure-bash CLI to manage [`containerized-wordpress`](https://github.com/yourorg/containerized-wordpress) releases across multiple WordPress projects on a single host.
+A tiny pure-bash CLI to manage [`containerized-wordpress`](https://github.com/simonecerruti/containerized-wordpress) releases across multiple WordPress projects on a single host.
 
 It downloads versioned base tarballs from GitHub, applies them to per-project directories, and optionally rebuilds containers — all without needing `git` installed on the host.
 
