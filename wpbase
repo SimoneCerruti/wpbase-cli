@@ -2,7 +2,7 @@
 # wpbase - manage containerized-wordpress across multiple projects on the host.
 #
 # Configure:
-#   echo "https://github.com/SimoneCeruti/containerized-wordpress" | sudo tee /etc/wpbase/repo
+#   echo "https://github.com/SimoneCerruti/containerized-wordpress" | sudo tee /etc/wpbase/repo
 #   echo "/path/to/project" | sudo tee /etc/wpbase/projects.list
 #   # one project path per line in projects.list
 #

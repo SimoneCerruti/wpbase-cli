@@ -19,6 +19,14 @@ jobs:
       - name: Syntax-check wpbase
         run: bash -n wpbase
 
+      - name: Ensure CHANGELOG has an entry for this tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -qE "^## \[${version}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${version}]' section for tag ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

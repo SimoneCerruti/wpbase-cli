@@ -21,6 +21,18 @@ section when cutting the release.
 
 _Nothing yet._
 
+## [1.0.2] - 2026-05-26
+
+### Fixed
+
+- Correct a typo in the `--help` config example URL (`SimoneCeruti` ->
+  `SimoneCerruti`).
+
+### Changed
+
+- The release workflow now fails if `CHANGELOG.md` has no `## [X.Y.Z]` section
+  matching the pushed tag, so a release can't ship with a stale changelog.
+
 ## [1.0.1] - 2026-05-26
 
 ### Changed
