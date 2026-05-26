@@ -210,7 +210,7 @@ require_compose_version() {
 project_rebuild() {
     local project="$1"
     info "Rebuilding $project..."
-    ( cd "$project" && docker compose build --no-cache wordpress && docker compose up -d ) \
+    ( cd "$project" && docker compose build --no-cache wp && docker compose up -d ) \
         || { warn "Rebuild failed for $project"; return 1; }
 }
 
