@@ -59,7 +59,9 @@ EOF
 
 Lines starting with `#` are comments. Empty lines are ignored.
 
-Cache lives in `/var/cache/wpbase/` (auto-created). Override paths via `WPBASE_CONF_DIR` and `WPBASE_CACHE_DIR` env vars.
+An optional `/etc/wpbase/self-repo` (single line: `owner/repo` or a URL) points `wpbase self-update` at its own repo; it defaults to `SimoneCerruti/wpbase-cli`.
+
+Cache lives in `/var/cache/wpbase/` and logs append to `/var/log/wpbase.log` (both auto-created). Override paths via `WPBASE_CONF_DIR`, `WPBASE_CACHE_DIR`, `WPBASE_LOG_FILE`, and the self-update repo via `WPBASE_SELF_SLUG`.
 
 ## Usage
 
@@ -144,6 +146,31 @@ wpbase diff /srv/projects/site-one
 
 Shows checksum drift and (if drifted) a `diff -rq` against the freshly fetched tarball.
 
+### Verify every project at once
+
+```bash
+wpbase verify
+```
+
+A read-only, offline mass drift check across all registered projects. Prints a table like `wpbase list` and **exits non-zero (3)** if any project is missing its `base/`, uninitialised, or drifted — handy in cron/CI.
+
+### Remove a project
+
+```bash
+wpbase uninstall /srv/projects/old-site
+```
+
+Removes the wpbase-managed `base/`, `base.old/` and `.base-version`, then untracks the path from `projects.list`. Prompts unless `--yes`, and **keeps** your `docker-compose.yml`, `.env`, `.env.wordpress`, and `overrides/`.
+
+### Update wpbase itself
+
+```bash
+sudo wpbase self-update              # latest release from its own repo
+sudo wpbase self-update --version 1.2.0
+```
+
+Downloads the `wpbase` script from its own repo, syntax-checks it, and replaces the installed copy in place (skips if already identical, unless `--force`). Needs write access to the install path — hence `sudo`.
+
 ## Flags
 
 | Flag             | Meaning                                                  |
@@ -163,7 +190,7 @@ For each project, `wpbase`:
 2. Extracts a subset (`configs/`, `scripts/`, `overrides/`, `Dockerfile.base`, `compose.base.yml`, `VERSION`) into `<project>/.base-staging-XXXXXX/`
 3. Atomically swaps the staging dir into `<project>/base/`
 4. Writes `<project>/.base-version` and `<project>/base/.checksum`
-5. Optionally runs `docker compose build --no-cache wordpress && docker compose up -d`
+5. Optionally runs `docker compose build --no-cache wp && docker compose up -d`
 
 Drift detection compares the stored checksum against a fresh hash of `base/` on every operation. Drift is warned about, never blocking.
 
@@ -174,7 +201,7 @@ Drift detection compares the stored checksum against a fresh hash of `base/` on 
 | `0`  | Success                                              |
 | `1`  | User error (bad args, missing config, etc.)          |
 | `2`  | Network or IO error                                  |
-| `3`  | Partial failure during `update-all` (some succeeded) |
+| `3`  | Drift or partial failure (`update-all` failures, or `verify` found drift) |
 
 ## Limitations
 

@@ -49,10 +49,12 @@ Given a host with several WordPress projects, each pinned to some version of `co
 
 - `repo` -- single line, GitHub URL of the base repo. Example: `https://github.com/simonecerruti/containerized-wordpress`
 - `projects.list` -- one absolute path per line. Lines starting with `#` are comments. Empty lines ignored.
+- `self-repo` -- optional, single line (`owner/repo` or URL). wpbase's OWN repo for `self-update`. Defaults to `SimoneCerruti/wpbase-cli`.
 
 Cache: `/var/cache/wpbase/<version>/` -- extracted tarballs are kept here for reuse.
+Log: `/var/log/wpbase.log` -- every `info`/`warn`/`die` is appended here (best-effort; silently skipped if not writable).
 
-Override via env: `WPBASE_CONF_DIR`, `WPBASE_CACHE_DIR`.
+Override via env: `WPBASE_CONF_DIR`, `WPBASE_CACHE_DIR`, `WPBASE_LOG_FILE`, `WPBASE_SELF_SLUG`.
 
 ## Commands (summary)
 
@@ -63,6 +65,9 @@ wpbase install <ver> <path>       -- bootstrap base/ in a new project
 wpbase update [<path>]            -- update one project (or use --version X)
 wpbase update-all                 -- update every registered project
 wpbase diff <path>                -- detect manual edits to base/
+wpbase verify                     -- read-only drift check across all projects
+wpbase uninstall <path>           -- remove base/ and untrack the project
+wpbase self-update                -- replace wpbase with the latest from its repo
 ```
 
 Flags: `--version X.Y.Z`, `--yes`, `--build`, `--dry-run`, `--force`.
@@ -129,7 +134,7 @@ When `--yes` is not passed, the script prompts per project. This is deliberate: 
 
 - `set -uo pipefail` at top. NOT `-e` -- the script uses explicit exit code handling and per-iteration error counting in `update-all`. Don't add `-e` without rewriting those loops.
 - `die "msg" [exit_code]`, `info "msg"`, `warn "msg"` helpers. Always use them, never `echo` ad-hoc.
-- Exit codes: `0` OK, `1` user error (bad args, missing config), `2` network/IO error, `3` partial failure on `update-all` (some projects failed, some succeeded).
+- Exit codes: `0` OK, `1` user error (bad args, missing config), `2` network/IO error, `3` drift or partial failure (`update-all` had failures, or `verify` detected drift/issues).
 - Function names: `snake_case`. Variable names: `UPPER_SNAKE` for globals/env, `snake_case` for locals. Use `local` inside functions.
 - English everywhere. Italian only in error messages that an Italian admin would read directly. There aren't any currently in `wpbase` -- this is sysadmin-facing tooling.
 
@@ -173,6 +178,10 @@ A proper `bats` suite is on the roadmap. Anyone touching `wpbase` should at mini
 | What gets extracted into base/          | `install_base_into_project()` -- the for/cp block |
 | Project-root template seeding           | `seed_project_templates()` (called only by `cmd_install`) |
 | Docker Compose version preflight        | `require_compose_version()` -- gated on `--build` in `cmd_update` / `cmd_update_all` |
+| Read-only mass drift check              | `cmd_verify()` (exits 3 on any drift)             |
+| Removing / untracking a project         | `cmd_uninstall()` + `untrack_project()`           |
+| Self-update + wpbase's own repo         | `cmd_self_update()`, `WPBASE_SELF_SLUG`           |
+| Log destination / format                | `_log()` and `WPBASE_LOG_FILE`                    |
 | What counts for drift detection         | `project_base_checksum()`                         |
 | Adding GitHub token support             | `fetch_latest_version()`, `fetch_all_versions()`  |
 | Changing confirmation UX                | `confirm()` and call sites                        |
@@ -188,7 +197,7 @@ A proper `bats` suite is on the roadmap. Anyone touching `wpbase` should at mini
 
 4. **`docker compose build` requires the project to be a valid compose project.** If the user has a broken `docker-compose.yml`, `--build` will fail. The script reports failure per-project but does not roll back the base update. Rationale: a half-rolled update is still a valid state to debug from.
 
-5. **No `wpbase uninstall`.** Removing a project from `projects.list` is manual. There's no command to wipe `base/` from a project. This is intentional -- destructive ops should be explicit.
+5. **`wpbase uninstall <path>` is destructive but explicit.** It removes the wpbase-managed `base/`, `base.old/` and `.base-version`, then untracks the project from `projects.list`. It prompts unless `--yes`, and deliberately keeps user-owned files (`docker-compose.yml`, `.env`, `.env.wordpress`, `overrides/`). Cached tarballs in `/var/cache/wpbase/` are left as-is (shared across projects).
 
 6. **`.checksum` includes everything except itself.** The `find ... ! -name '.checksum'` filter excludes the file from its own hash. Don't add other auto-generated files to `base/` without similar exclusion, or every operation will look like drift.
 
@@ -224,12 +233,12 @@ sudo chmod +x /usr/local/bin/wpbase
 - [ ] `bats` test suite covering all commands against a local mock GitHub
 - [ ] `flock` to prevent concurrent runs
 - [ ] GitHub token support via `/etc/wpbase/github-token`
-- [ ] `wpbase uninstall <path>` -- removes base/, untracks from projects.list
-- [ ] `wpbase verify` -- verify all projects match their pinned version (read-only mass diff)
+- [x] `wpbase uninstall <path>` -- removes base/, untracks from projects.list
+- [x] `wpbase verify` -- verify all projects match their pinned version (read-only mass diff)
 - [ ] Resume-on-crash: detect lingering `base.old/` and offer to roll back
 - [ ] Shell completion (bash + zsh)
-- [ ] Logging to `/var/log/wpbase.log` (currently only stdout/stderr)
-- [ ] Self-update command: `wpbase self-update` -- download latest wpbase from its own repo
+- [x] Logging to `/var/log/wpbase.log` (every info/warn/die; override WPBASE_LOG_FILE)
+- [x] Self-update command: `wpbase self-update` -- download latest wpbase from its own repo
 
 ## How to verify this CLAUDE.md is still accurate
 

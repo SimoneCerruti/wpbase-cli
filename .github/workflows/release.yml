@@ -1,0 +1,29 @@
+name: release
+
+# Cut a release by pushing a SemVer tag on main:
+#   git tag -a v1.2.3 -m "v1.2.3" && git push origin v1.2.3
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check wpbase
+        run: bash -n wpbase
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            wpbase

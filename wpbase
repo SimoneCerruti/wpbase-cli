@@ -19,26 +19,39 @@
 #   wpbase update [<path>]         update single project to latest (or to --version X)
 #   wpbase update-all              update every project in projects.list
 #   wpbase diff <path>             show base/ checksum drift (manual edits warning)
+#   wpbase verify                  read-only drift check across all projects (exit 3 if any drift)
+#   wpbase uninstall <path>        remove wpbase-managed base/ and untrack the project
+#   wpbase self-update             replace this script with the latest from its own repo
 #
 # Flags (where applicable):
 #   --version X.Y.Z   pin to a specific version (default: latest release)
-#   --yes             skip confirmation prompts
+#   --yes / -y        skip confirmation prompts
 #   --build           also run `docker compose build && up -d` after update (needs Compose v2.24+)
 #   --dry-run         default for update-all; show what would happen, do nothing
+#   --force           reinstall/overwrite even if already at the target version
 #
-# Exit codes: 0 OK, 1 user error, 2 network/io error, 3 partial failure on update-all
+# Logs: appends to /var/log/wpbase.log (override with WPBASE_LOG_FILE).
+#
+# Exit codes: 0 OK, 1 user error, 2 network/io error, 3 drift/partial failure
 
 set -uo pipefail
 
 WPBASE_CONF_DIR="${WPBASE_CONF_DIR:-/etc/wpbase}"
 WPBASE_CACHE_DIR="${WPBASE_CACHE_DIR:-/var/cache/wpbase}"
+WPBASE_LOG_FILE="${WPBASE_LOG_FILE:-/var/log/wpbase.log}"
 REPO_FILE="$WPBASE_CONF_DIR/repo"
 PROJECTS_FILE="$WPBASE_CONF_DIR/projects.list"
+# wpbase's OWN repo, used only by `self-update`. Override via the WPBASE_SELF_SLUG
+# env var or a $WPBASE_CONF_DIR/self-repo file (single line: owner/repo or a URL).
+WPBASE_SELF_SLUG="${WPBASE_SELF_SLUG:-SimoneCerruti/wpbase-cli}"
 
 # ---------- helpers ----------
-die() { echo "ERROR: $1" >&2; exit "${2:-1}"; }
-info() { echo "[wpbase] $*"; }
-warn() { echo "[wpbase] WARN: $*" >&2; }
+# Best-effort timestamped append to the log file; logging must never fail a command.
+_log() { { printf '[%s] %s\n' "$(date -Iseconds 2>/dev/null)" "$*" >> "$WPBASE_LOG_FILE"; } 2>/dev/null || true; }
+# Diagnostics go to stderr (keeping stdout clean for captured output) and to the log.
+die() { _log "ERROR: $1"; echo "ERROR: $1" >&2; exit "${2:-1}"; }
+info() { _log "$*"; echo "[wpbase] $*" >&2; }
+warn() { _log "WARN: $*"; echo "[wpbase] WARN: $*" >&2; }
 
 require_repo() {
     [[ -f "$REPO_FILE" ]] || die "Missing $REPO_FILE. Write the GitHub repo URL there." 1
@@ -365,6 +378,144 @@ cmd_diff() {
     fi
 }
 
+# Read-only drift check across all registered projects (offline, checksum-based).
+# Exits 3 if any project is missing, uninitialised, or has drifted from its pin.
+cmd_verify() {
+    [[ -f "$PROJECTS_FILE" ]] || die "Missing $PROJECTS_FILE" 1
+    printf "%-50s %-10s %s\n" "PROJECT" "VERSION" "STATUS"
+    local total=0 issues=0
+    while IFS= read -r project; do
+        [[ -z "$project" || "$project" =~ ^# ]] && continue
+        ((total++))
+        local v status
+        v=$(project_version "$project")
+        if [[ -z "$v" ]]; then
+            status="not-initialized"; v="-"; ((issues++))
+        elif [[ ! -d "$project/base" ]]; then
+            status="missing-base"; ((issues++))
+        else
+            local rec cur
+            rec=$(head -n1 "$project/base/.checksum" 2>/dev/null)
+            cur=$(project_base_checksum "$project")
+            if [[ -z "$rec" ]]; then
+                status="no-checksum"; ((issues++))
+            elif [[ "$rec" != "$cur" ]]; then
+                status="MODIFIED"; ((issues++))
+            else
+                status="clean"
+            fi
+        fi
+        printf "%-50s %-10s %s\n" "$project" "$v" "$status"
+    done < "$PROJECTS_FILE"
+    info "Verified $total project(s): $issues with drift/issues."
+    (( issues > 0 )) && exit 3 || exit 0
+}
+
+# Remove a project's path from projects.list (exact full-line match), preserving
+# the file's permissions/ownership (truncate-in-place rather than mv).
+untrack_project() {
+    local project="$1"
+    [[ -f "$PROJECTS_FILE" ]] || return 0
+    grep -qxF -- "$project" "$PROJECTS_FILE" || { info "$project was not tracked in $PROJECTS_FILE."; return 0; }
+    local tmp; tmp=$(mktemp)
+    grep -vxF -- "$project" "$PROJECTS_FILE" > "$tmp"
+    cat "$tmp" > "$PROJECTS_FILE"
+    rm -f "$tmp"
+    info "Untracked $project from $PROJECTS_FILE."
+}
+
+# Remove the wpbase-managed footprint from a project: base/, base.old/ and the
+# .base-version pin, then untrack it. User-owned files (docker-compose.yml, .env,
+# .env.wordpress, overrides/) are deliberately left intact.
+cmd_uninstall() {
+    local project="${1:-}"
+    [[ -z "$project" ]] && die "Usage: wpbase uninstall <project-path>" 1
+
+    local managed=0 tracked=0
+    [[ -d "$project/base" || -d "$project/base.old" || -f "$project/.base-version" ]] && managed=1
+    [[ -f "$PROJECTS_FILE" ]] && grep -qxF -- "$project" "$PROJECTS_FILE" && tracked=1
+    if (( ! managed && ! tracked )); then
+        info "Nothing to uninstall: no wpbase base/ and not tracked at $project."
+        return 0
+    fi
+
+    if (( ! YES )); then
+        warn "About to remove base/, base.old/ and .base-version from $project, and untrack it."
+        warn "User files (docker-compose.yml, .env, .env.wordpress, overrides/) are kept."
+        confirm "Proceed?" || { info "Aborted."; return 0; }
+    fi
+
+    rm -rf "$project/base" "$project/base.old"
+    rm -f "$project/.base-version"
+    untrack_project "$project"
+    info "Uninstalled wpbase base/ from $project."
+}
+
+# Replace this script in place with the latest wpbase from its own GitHub repo.
+# Validates shebang + `bash -n` before overwriting; skips if identical unless
+# --force. Requires write access to the installed target.
+cmd_self_update() {
+    local slug="$WPBASE_SELF_SLUG"
+    if [[ -f "$WPBASE_CONF_DIR/self-repo" ]]; then
+        slug=$(head -n1 "$WPBASE_CONF_DIR/self-repo" \
+            | sed -E 's#^https?://github\.com/##; s#\.git$##; s#/$##; s/[[:space:]]//g')
+    fi
+    [[ "$slug" =~ ^[^/]+/[^/]+$ ]] || die "Invalid wpbase repo slug: '$slug'" 1
+
+    local ref ver
+    if [[ "$VERSION_FLAG" == "latest" ]]; then
+        ver=$(curl -fsS "https://api.github.com/repos/$slug/releases/latest" 2>/dev/null \
+            | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -n1)
+        [[ -n "$ver" ]] || die "Could not resolve latest release from $slug (none yet?). Try --version X.Y.Z." 2
+        ref="$ver"
+    else
+        ref="v${VERSION_FLAG#v}"
+    fi
+
+    # Where am I installed? Prefer an explicit override, then an absolute $0,
+    # then the wpbase found on PATH.
+    local target
+    if [[ -n "${WPBASE_SELF_PATH:-}" ]]; then
+        target="$WPBASE_SELF_PATH"
+    elif [[ "$0" == /* ]]; then
+        target="$0"
+    else
+        target=$(command -v wpbase 2>/dev/null || echo "$0")
+    fi
+    [[ -f "$target" ]] || die "Cannot locate the installed wpbase to replace ('$target')." 1
+    [[ -w "$target" ]] || die "Cannot write to $target. Re-run with sudo." 1
+
+    info "Fetching wpbase $ref from $slug..."
+    local tmp; tmp=$(mktemp)
+    trap "rm -f '$tmp'" RETURN
+    local raw1="https://raw.githubusercontent.com/$slug/${ref}/wpbase"
+    local raw2="https://raw.githubusercontent.com/$slug/${ref#v}/wpbase"
+    curl -fsSL -o "$tmp" "$raw1" 2>/dev/null || curl -fsSL -o "$tmp" "$raw2" \
+        || die "Failed to download wpbase $ref from $slug." 2
+
+    head -n1 "$tmp" | grep -q '^#!.*bash' || die "Downloaded file is not a bash script; aborting." 2
+    bash -n "$tmp" 2>/dev/null || die "Downloaded wpbase failed the syntax check; not installing." 2
+
+    if (( ! FORCE )) && cmp -s "$tmp" "$target"; then
+        info "Already up to date with $ref ($target)."
+        return 0
+    fi
+    if (( ! YES )); then
+        confirm "Replace $target with wpbase $ref from $slug?" || { info "Aborted."; return 0; }
+    fi
+
+    # Atomic in-place replace, preserving the current file mode. mv (rename) keeps
+    # the running process's old inode intact, so self-replacement is safe.
+    local mode dir dtmp
+    mode=$(stat -c '%a' "$target" 2>/dev/null || echo 755)
+    dir=$(dirname "$target")
+    dtmp=$(mktemp "$dir/.wpbase-update-XXXXXX") || die "Cannot stage update in $dir (writable?)." 2
+    cat "$tmp" > "$dtmp"
+    chmod "$mode" "$dtmp"
+    mv -f "$dtmp" "$target" || { rm -f "$dtmp"; die "Failed to install update to $target." 2; }
+    info "Updated wpbase to $ref at $target."
+}
+
 # ---------- arg parsing ----------
 VERSION_FLAG="latest"
 YES=0
@@ -383,7 +534,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1; shift ;;
         --force) FORCE=1; shift ;;
         --help|-h)
-            sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         -*) die "Unknown flag: $1" 1 ;;
@@ -407,7 +558,10 @@ case "$COMMAND" in
     install)    cmd_install "${ARGS[@]:-}" ;;
     update)     cmd_update "${ARGS[@]:-}" ;;
     update-all) cmd_update_all ;;
-    diff)       cmd_diff "${ARGS[@]:-}" ;;
-    "")         die "Missing command. Run 'wpbase --help'" 1 ;;
-    *)          die "Unknown command: $COMMAND. Run 'wpbase --help'" 1 ;;
+    diff)        cmd_diff "${ARGS[@]:-}" ;;
+    verify)      cmd_verify ;;
+    uninstall)   cmd_uninstall "${ARGS[@]:-}" ;;
+    self-update) cmd_self_update ;;
+    "")          die "Missing command. Run 'wpbase --help'" 1 ;;
+    *)           die "Unknown command: $COMMAND. Run 'wpbase --help'" 1 ;;
 esac
