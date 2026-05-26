@@ -16,7 +16,7 @@ This is that script.
 
 - Linux host (tested on Debian)
 - `bash`, `curl`, `tar`, `sha256sum` — all standard
-- `docker compose` **v2.24+** if you want `--build` (needed for the `include:` in `compose.base.yml`)
+- `docker compose` **v5.1+** if you want `--build` (the project compose redefines the `wp` service it `include:`s from `compose.base.yml`; v2.x errors with `conflicts with imported resource`). Install with `apt-get install docker-compose-plugin`.
 - Public internet access to `api.github.com` and `github.com`
 
 No git on the host. No Python. No jq.
@@ -177,7 +177,7 @@ Downloads the `wpbase` script from its own repo, syntax-checks it, and replaces 
 | ---------------- | -------------------------------------------------------- |
 | `--version X.Y.Z`| Pin to a specific version (default: latest release)      |
 | `--yes` / `-y`   | Skip confirmation prompts                                |
-| `--build`        | Run `docker compose build && up -d` after update (needs Compose v2.24+) |
+| `--build`        | Run `docker compose build && up -d` after update (needs Compose v5.1+) |
 | `--dry-run`      | Show what would happen, do nothing                       |
 | `--force`        | Reinstall even if already at the target version          |
 | `--help` / `-h`  | Show help and exit                                       |

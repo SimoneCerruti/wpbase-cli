@@ -21,6 +21,18 @@ section when cutting the release.
 
 _Nothing yet._
 
+## [1.0.3] - 2026-05-26
+
+### Fixed
+
+- `install` now scaffolds the project-root `overrides/` tree
+  (`seed_project_overrides`) when absent — fresh projects failed
+  `docker compose build` with `"/overrides": not found`, because the base's
+  `COPY overrides /opt/overrides` reads from the project root.
+- `require_compose_version` minimum raised **v2.24 → v5.1**: the project compose
+  redefines the `wp` service imported via `include:`, which Compose only merges
+  from v5.1+ (verified: v2.39.2 fails with `conflicts with imported resource`).
+
 ## [1.0.2] - 2026-05-26
 
 ### Fixed

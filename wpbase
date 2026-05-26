@@ -21,7 +21,7 @@
 # Flags (where applicable):
 #   --version X.Y.Z   pin to a specific version (default: latest release)
 #   --yes / -y        skip confirmation prompts
-#   --build           also run `docker compose build && up -d` after update (needs Compose v2.24+)
+#   --build           also run `docker compose build && up -d` after update (needs Compose v5.1+)
 #   --dry-run         default for update-all; show what would happen, do nothing
 #   --force           reinstall/overwrite even if already at the target version
 #
@@ -198,12 +198,35 @@ seed_project_templates() {
     (( seeded )) && info "Add .env and .env.wordpress to the project's .gitignore (they hold secrets)."
 }
 
-# Preflight: the `include:`/`project_directory:` in compose.base.yml need
-# Docker Compose v2.24+. Only called on paths that shell out to `docker compose`.
+# Create the project's overrides/ tree on first install if absent. The project
+# build's `COPY overrides /opt/overrides` (base/Dockerfile.base, build context =
+# the project root) requires it to exist — without it the build fails with
+# `"/overrides": not found`. Copies the base's shipped overrides skeleton;
+# never overwrites an existing tree (it holds the project's customization).
+seed_project_overrides() {
+    local project="$1" extracted="$2"
+    if [[ -e "$project/overrides" ]]; then
+        info "Kept existing overrides/ (skeleton not applied)."
+        return 0
+    fi
+    if [[ -d "$extracted/overrides" ]]; then
+        cp -a "$extracted/overrides" "$project/overrides"
+    else
+        mkdir -p "$project/overrides"
+        : > "$project/overrides/.gitkeep"
+    fi
+    info "Created overrides/ for project customization."
+}
+
+# Preflight: the project's docker-compose.yml redefines the `wp` service it
+# imports via `include:` from compose.base.yml. Compose only MERGES an
+# overridden imported service from v5.1+; v2.x errors with
+# "services.wp conflicts with imported resource". Only called on paths that
+# shell out to `docker compose`.
 require_compose_version() {
-    local min_major=2 min_minor=24 ver major minor
+    local min_major=5 min_minor=1 ver major minor
     ver=$(docker compose version --short 2>/dev/null) \
-        || die "docker compose not found (required for --build). Install the Compose v2 plugin." 2
+        || die "docker compose not found (required for --build). Install/upgrade the Docker Compose plugin." 2
     ver="${ver#v}"
     major="${ver%%.*}"
     minor="${ver#*.}"; minor="${minor%%.*}"
@@ -267,6 +290,7 @@ cmd_install() {
     extracted=$(fetch_tarball "$version")
     install_base_into_project "$project" "$version" "$extracted"
     seed_project_templates "$project" "$extracted"
+    seed_project_overrides "$project" "$extracted"
     info "Done. Next: cd $project && docker compose build && docker compose up -d"
 }
 
