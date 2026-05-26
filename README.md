@@ -16,7 +16,7 @@ This is that script.
 
 - Linux host (tested on Debian)
 - `bash`, `curl`, `tar`, `sha256sum` — all standard
-- `docker compose` if you want `--build`
+- `docker compose` **v2.24+** if you want `--build` (needed for the `include:` in `compose.base.yml`)
 - Public internet access to `api.github.com` and `github.com`
 
 No git on the host. No Python. No jq.
@@ -94,16 +94,29 @@ Lists tags from `containerized-wordpress` GitHub releases, newest first.
 wpbase install 1.0.0 /srv/projects/new-site
 ```
 
-Downloads `v1.0.0` and writes `base/`, `.base-version`, and a checksum into the project. Add the path to `/etc/wpbase/projects.list` afterwards.
+Downloads `v1.0.0` and writes `base/`, `.base-version`, and a checksum into the project.
+
+On a fresh project it also scaffolds the runnable project-root files from the release templates — `docker-compose.yml` (from `compose.example.yml`), `.env` (from `.env.example`), and `.env.wordpress` (from `.env.wordpress.example`) — **only if they don't already exist**. Existing files are never overwritten, and `wpbase update` leaves these project-root files alone entirely.
+
+Then fill in the scaffolded files and keep the secrets out of git:
+
+```bash
+cd /srv/projects/new-site
+$EDITOR .env .env.wordpress          # set project name, domain, DB creds, etc.
+printf '.env\n.env.wordpress\n' >> .gitignore
+docker compose up -d --build
+```
+
+Then add the path to `/etc/wpbase/projects.list`.
 
 ### Update a single project
 
 ```bash
 # Dry-run-ish: confirm prompt, no rebuild
-wpbase update /srv/projects/site-one --version 1.1.0
+wpbase update /srv/projects/site-one --version 1.0.0
 
 # Non-interactive, rebuild and restart
-wpbase update /srv/projects/site-one --version 1.1.0 --yes --build
+wpbase update /srv/projects/site-one --version 1.0.0 --yes --build
 ```
 
 If you omit `--version`, the latest GitHub release is used.
@@ -115,10 +128,10 @@ If you omit `--version`, the latest GitHub release is used.
 wpbase update-all
 
 # Apply with per-project confirmation, no rebuild
-wpbase update-all --version 1.1.0
+wpbase update-all --version 1.0.0
 
 # Apply everywhere, rebuild and restart everything
-wpbase update-all --version 1.1.0 --yes --build
+wpbase update-all --version 1.0.0 --yes --build
 ```
 
 `update-all` is dry-run by default. You need to explicitly pass `--yes` or `--build` for it to do anything.
@@ -137,7 +150,7 @@ Shows checksum drift and (if drifted) a `diff -rq` against the freshly fetched t
 | ---------------- | -------------------------------------------------------- |
 | `--version X.Y.Z`| Pin to a specific version (default: latest release)      |
 | `--yes` / `-y`   | Skip confirmation prompts                                |
-| `--build`        | Run `docker compose build && up -d` after update         |
+| `--build`        | Run `docker compose build && up -d` after update (needs Compose v2.24+) |
 | `--dry-run`      | Show what would happen, do nothing                       |
 | `--force`        | Reinstall even if already at the target version          |
 | `--help` / `-h`  | Show help and exit                                       |
@@ -147,7 +160,7 @@ Shows checksum drift and (if drifted) a `diff -rq` against the freshly fetched t
 For each project, `wpbase`:
 
 1. Downloads `https://github.com/<repo>/archive/refs/tags/v<version>.tar.gz` into `/var/cache/wpbase/<version>/`
-2. Extracts a subset (`configs/`, `scripts/`, `overrides/`, `Dockerfile.base`, `VERSION`) into `<project>/.base-staging-XXXXXX/`
+2. Extracts a subset (`configs/`, `scripts/`, `overrides/`, `Dockerfile.base`, `compose.base.yml`, `VERSION`) into `<project>/.base-staging-XXXXXX/`
 3. Atomically swaps the staging dir into `<project>/base/`
 4. Writes `<project>/.base-version` and `<project>/base/.checksum`
 5. Optionally runs `docker compose build --no-cache wordpress && docker compose up -d`

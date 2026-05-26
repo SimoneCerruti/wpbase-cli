@@ -15,6 +15,7 @@
 #   wpbase list                    list registered projects with their pinned version
 #   wpbase versions                list available base versions (from GitHub releases)
 #   wpbase install <ver> <path>    install version <ver> into a fresh project at <path>
+#                                  (also scaffolds docker-compose.yml, .env, .env.wordpress if absent)
 #   wpbase update [<path>]         update single project to latest (or to --version X)
 #   wpbase update-all              update every project in projects.list
 #   wpbase diff <path>             show base/ checksum drift (manual edits warning)
@@ -22,7 +23,7 @@
 # Flags (where applicable):
 #   --version X.Y.Z   pin to a specific version (default: latest release)
 #   --yes             skip confirmation prompts
-#   --build           also run `docker compose build && up -d` after update
+#   --build           also run `docker compose build && up -d` after update (needs Compose v2.24+)
 #   --dry-run         default for update-all; show what would happen, do nothing
 #
 # Exit codes: 0 OK, 1 user error, 2 network/io error, 3 partial failure on update-all
@@ -35,7 +36,7 @@ REPO_FILE="$WPBASE_CONF_DIR/repo"
 PROJECTS_FILE="$WPBASE_CONF_DIR/projects.list"
 
 # ---------- helpers ----------
-die() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
+die() { echo "ERROR: $1" >&2; exit "${2:-1}"; }
 info() { echo "[wpbase] $*"; }
 warn() { echo "[wpbase] WARN: $*" >&2; }
 
@@ -136,12 +137,15 @@ install_base_into_project() {
     staging=$(mktemp -d "$project/.base-staging-XXXXXX")
     trap "rm -rf '$staging'" RETURN
 
-    # Copy the subset of repo files relevant for the project
+    # Copy the subset of repo files relevant for the project into base/.
+    # Files absent from the tarball are skipped silently, 
+    # so one wpbase can manage projects pinned to mixed versions.
     for d in configs scripts overrides; do
         [[ -d "$extracted/$d" ]] && cp -a "$extracted/$d" "$staging/"
     done
-    cp "$extracted/Dockerfile.base" "$staging/" 2>/dev/null || true
-    cp "$extracted/VERSION" "$staging/" 2>/dev/null || true
+    for f in Dockerfile.base VERSION compose.base.yml; do
+        [[ -f "$extracted/$f" ]] && cp -a "$extracted/$f" "$staging/"
+    done
 
     # Atomic swap
     rm -rf "$project/base.old" 2>/dev/null || true
@@ -155,6 +159,51 @@ install_base_into_project() {
     project_base_checksum "$project" > "$project/base/.checksum"
 
     info "Installed base v$version into $project"
+}
+
+# Scaffold project-root files from the base's templates, on first install only.
+# Each template maps to a LIVE project file (see containerized-wordpress
+# REPO-MAP.md). Never overwrites an existing destination (they hold secrets /
+# customisation) and is never run by `update`. Templates absent from the tarball
+# (older base versions) are skipped silently.
+seed_project_templates() {
+    local project="$1" extracted="$2"
+    local pair src dst seeded=0
+
+    # "<template in tarball>:<live file scaffolded into the project root>"
+    for pair in \
+        "compose.example.yml:docker-compose.yml" \
+        ".env.example:.env" \
+        ".env.wordpress.example:.env.wordpress"; do
+        src="$extracted/${pair%%:*}"
+        dst="$project/${pair##*:}"
+        [[ -f "$src" ]] || continue
+        if [[ -e "$dst" ]]; then
+            info "Kept existing ${pair##*:} (template not applied)."
+        else
+            cp -a "$src" "$dst"
+            info "Scaffolded ${pair##*:} from template -- edit before first boot."
+            seeded=1
+        fi
+    done
+
+    (( seeded )) && info "Add .env and .env.wordpress to the project's .gitignore (they hold secrets)."
+}
+
+# Preflight: the `include:`/`project_directory:` in compose.base.yml need
+# Docker Compose v2.24+. Only called on paths that shell out to `docker compose`.
+require_compose_version() {
+    local min_major=2 min_minor=24 ver major minor
+    ver=$(docker compose version --short 2>/dev/null) \
+        || die "docker compose not found (required for --build). Install the Compose v2 plugin." 2
+    ver="${ver#v}"
+    major="${ver%%.*}"
+    minor="${ver#*.}"; minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] \
+        || die "Could not parse 'docker compose version': '$ver'" 2
+    if (( major < min_major || (major == min_major && minor < min_minor) )); then
+        die "docker compose v${min_major}.${min_minor}+ required for include: (found v${ver}). Upgrade the Compose plugin on this host." 2
+    fi
 }
 
 # Run docker compose rebuild on a project
@@ -209,6 +258,7 @@ cmd_install() {
     local extracted
     extracted=$(fetch_tarball "$version")
     install_base_into_project "$project" "$version" "$extracted"
+    seed_project_templates "$project" "$extracted"
     info "Done. Next: cd $project && docker compose build && docker compose up -d"
 }
 
@@ -216,6 +266,7 @@ cmd_update() {
     local project="${1:-}"
     local version="$VERSION_FLAG"
     [[ -z "$project" ]] && die "Usage: wpbase update <project-path> [--version X]" 1
+    (( BUILD )) && require_compose_version
     [[ "$version" == "latest" ]] && version=$(fetch_latest_version)
 
     local current
@@ -248,6 +299,7 @@ cmd_update() {
 cmd_update_all() {
     [[ -f "$PROJECTS_FILE" ]] || die "Missing $PROJECTS_FILE" 1
     local version="$VERSION_FLAG"
+    (( BUILD )) && require_compose_version
     [[ "$version" == "latest" ]] && version=$(fetch_latest_version)
 
     info "Target version: v$version"
@@ -331,7 +383,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1; shift ;;
         --force) FORCE=1; shift ;;
         --help|-h)
-            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         -*) die "Unknown flag: $1" 1 ;;

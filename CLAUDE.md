@@ -106,9 +106,12 @@ When installing, only these paths are copied from the release tarball into `<pro
 - `scripts/`
 - `overrides/` (the base's empty placeholder `.gitkeep`)
 - `Dockerfile.base`
+- `compose.base.yml`
 - `VERSION`
 
 Everything else (release notes, README, CLAUDE.md, .github/) is ignored. This keeps the project repo clean.
+
+On `install` only, `seed_project_templates()` additionally scaffolds the runnable project-root files from the base's templates: `compose.example.yml` -> `<project>/docker-compose.yml`, `.env.example` -> `<project>/.env`, and `.env.wordpress.example` -> `<project>/.env.wordpress`. These land in the *project root* (not `base/`), only when the destination is absent, and are never touched by `update`. Authoritative source -> dest mapping: containerized-wordpress `REPO-MAP.md`.
 
 ### 6. Version pin file.
 
@@ -168,6 +171,8 @@ A proper `bats` suite is on the roadmap. Anyone touching `wpbase` should at mini
 | A new flag                              | Add to the `while [[ $# -gt 0 ]]` parser          |
 | Tarball URL format                      | `fetch_tarball()`                                 |
 | What gets extracted into base/          | `install_base_into_project()` -- the for/cp block |
+| Project-root template seeding           | `seed_project_templates()` (called only by `cmd_install`) |
+| Docker Compose version preflight        | `require_compose_version()` -- gated on `--build` in `cmd_update` / `cmd_update_all` |
 | What counts for drift detection         | `project_base_checksum()`                         |
 | Adding GitHub token support             | `fetch_latest_version()`, `fetch_all_versions()`  |
 | Changing confirmation UX                | `confirm()` and call sites                        |
@@ -200,14 +205,14 @@ Match the containerized-wordpress convention. Versions are SemVer-ish (`MAJOR.MI
 Cut a release:
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 If `.github/workflows/release.yml` is configured, that creates a GitHub Release with auto-generated notes. Users install with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/v1.1.0/wpbase \
+curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/v1.0.0/wpbase \
   | sudo tee /usr/local/bin/wpbase > /dev/null
 sudo chmod +x /usr/local/bin/wpbase
 ```
@@ -236,3 +241,7 @@ If wpbase is significantly modified, re-read this file and update:
 4. The "Roadmap" if a roadmap item shipped
 
 This file is the contract between the codebase and its future contributors. Keep it honest.
+
+# CLAUDE.md (containerized-wordpress)
+You can access the repo via the additionalDirectories setting.
+Write context that must be shared in @./SHARED_CONTEXT.md

@@ -8,3 +8,7 @@
 # Local test artifacts
 .cache/
 *.log
+
+SHARED_CONTEXT.md
+
+.claude
