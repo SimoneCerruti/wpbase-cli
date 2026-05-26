@@ -21,6 +21,14 @@ section when cutting the release.
 
 _Nothing yet._
 
+## [1.0.1] - 2026-05-26
+
+### Changed
+
+- Tidy the in-script `--help` header: drop the redundant install snippet and
+  refer to the base by its real name (`containerized-wordpress`). No behaviour
+  change.
+
 ## [1.0.0] - 2026-05-26
 
 Initial release.
